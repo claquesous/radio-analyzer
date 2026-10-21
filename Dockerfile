@@ -22,6 +22,12 @@ RUN mkdir -p $MODELS_DIR && cd $MODELS_DIR && \
 # Models are baked in above: never reach out to the Hugging Face hub at runtime.
 ENV HF_HUB_OFFLINE=1 TF_CPP_MIN_LOG_LEVEL=2
 
+# On Lambda, the Web Adapter extension turns each invocation into an HTTP request
+# to this server, once /health answers. Anywhere else it never starts, and the
+# image is a plain HTTP service.
+COPY --from=public.ecr.aws/awsguru/aws-lambda-adapter:1.0.1 /lambda-adapter /opt/extensions/lambda-adapter
+ENV PORT=8000 AWS_LWA_READINESS_CHECK_PATH=/health
+
 COPY . .
 
 RUN useradd -m -u 1000 analyzer && mkdir -p /cache && chown -R analyzer /cache $MODELS_DIR

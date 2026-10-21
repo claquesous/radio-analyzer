@@ -1,0 +1,11 @@
+{
+  "name": "claqradio-analyzer-deploy",
+  "private": true,
+  "description": "Deploys radio-analyzer to AWS Lambda with SST. The service itself is Python; see README.md.",
+  "scripts": {
+    "deploy": "sst deploy --stage production"
+  },
+  "devDependencies": {
+    "sst": "4.2.7"
+  }
+}

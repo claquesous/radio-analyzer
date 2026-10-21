@@ -1,3 +1,9 @@
 .git
 __pycache__
 .pytest_cache
+node_modules
+.sst
+sst.config.ts
+package.json
+package-lock.json
+sst-env.d.ts

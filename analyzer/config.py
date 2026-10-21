@@ -11,6 +11,13 @@ MB_CONTACT = os.environ.get("MB_CONTACT") or None
 
 USER_AGENT = f"ClaqRadio-Analyzer/0.1 ( {MB_CONTACT or 'no contact configured'} )"
 
+# When set, every endpoint but /health requires "Authorization: Bearer <token>".
+API_TOKEN = os.environ.get("ANALYZER_TOKEN") or None
+
 PORT = int(os.environ.get("PORT", "8000"))
+# Essentia processes. 0 analyzes in the server process instead: Lambda has no
+# /dev/shm, which a process pool needs, and serves one request at a time anyway.
 ANALYZE_WORKERS = int(os.environ.get("ANALYZE_WORKERS", "2"))
+# Seconds to connect to, and between bytes from, a song URL.
+DOWNLOAD_TIMEOUT = (10, 60)
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
