@@ -1,6 +1,8 @@
+import os
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+import requests
 from fastapi.testclient import TestClient
 
 from analyzer import audio, config, enrich, identify, server
@@ -75,6 +77,92 @@ def test_analyze(music, monkeypatch):
 
     monkeypatch.setattr(audio, "analyze_in_worker", corrupt)
     assert client.post("/analyze", json={"path": str(music)}).status_code == 422
+
+
+class FakeDownload:
+    def __init__(self, status=200, body=b"ID3 audio"):
+        self.status_code = status
+        self.body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"{self.status_code}")
+
+    def iter_content(self, chunk_size):
+        yield self.body
+
+
+URL = "https://bucket.s3.amazonaws.com/joy-division/substance/atmosphere.mp3?X-Amz-Signature=abc"
+
+
+def test_analyze_downloads_a_url(monkeypatch):
+    monkeypatch.setattr(server.app.state, "pool", ThreadPoolExecutor(1), raising=False)
+    monkeypatch.setattr(requests, "get", lambda url, **kw: FakeDownload())
+    seen = {}
+
+    def analyze(path):
+        with open(path, "rb") as f:
+            seen.update(path=path, body=f.read())
+        return {"bpm": 120.0}
+
+    monkeypatch.setattr(audio, "analyze_in_worker", analyze)
+    assert client.post("/analyze", json={"url": URL}).json() == {"bpm": 120.0}
+    assert seen["body"] == b"ID3 audio" and seen["path"].endswith(".mp3")
+    assert not os.path.exists(seen["path"])
+
+
+def test_identify_downloads_a_url(monkeypatch):
+    monkeypatch.setattr(requests, "get", lambda url, **kw: FakeDownload())
+    monkeypatch.setattr(identify, "resolve", lambda song: ("rec-1", "acoustid-1", "acoustid"))
+    response = client.post("/identify", json={"url": URL, "title": "Atmosphere", "artist": "Joy Division"})
+    assert response.json()["mb_recording_id"] == "rec-1"
+
+
+@pytest.mark.parametrize("status", [403, 404])
+def test_a_url_with_nothing_behind_it_is_a_missing_file(monkeypatch, status):
+    monkeypatch.setattr(requests, "get", lambda url, **kw: FakeDownload(status))
+    assert client.post("/analyze", json={"url": URL}).status_code == 404
+    response = client.post("/identify", json={"url": URL, "title": "x", "artist": "y"})
+    assert response.json()["status"] == "missing_file"
+
+
+def test_a_failed_download_is_a_bad_gateway(monkeypatch):
+    def unreachable(url, **kw):
+        raise requests.ConnectionError("connection reset")
+
+    monkeypatch.setattr(requests, "get", unreachable)
+    assert client.post("/analyze", json={"url": URL}).status_code == 502
+    monkeypatch.setattr(requests, "get", lambda url, **kw: FakeDownload(500))
+    assert client.post("/analyze", json={"url": URL}).status_code == 502
+
+
+def test_songs_need_exactly_one_of_path_and_url(music):
+    assert client.post("/analyze", json={}).status_code == 422
+    assert client.post("/analyze", json={"path": str(music), "url": URL}).status_code == 422
+
+
+def test_bearer_token(monkeypatch):
+    monkeypatch.setattr(config, "API_TOKEN", "s3cret")
+    assert client.get("/versions").status_code == 401
+    assert client.get("/versions", headers={"Authorization": "Bearer wrong"}).status_code == 401
+    assert client.get("/versions", headers={"Authorization": "Bearer s3cret"}).status_code == 200
+    assert client.get("/health").status_code == 200
+
+
+def test_analyzes_in_process_without_workers(music, monkeypatch):
+    monkeypatch.setattr(config, "MB_CONTACT", "test@example.com")
+    monkeypatch.setattr(config, "ANALYZE_WORKERS", 0)
+    monkeypatch.setattr(audio, "init_worker", lambda: None)
+    monkeypatch.setattr(audio, "analyze_in_worker", lambda path: {"pid": os.getpid()})
+    with TestClient(server.app) as in_process:
+        assert isinstance(server.app.state.pool, ThreadPoolExecutor)
+        assert in_process.post("/analyze", json={"path": str(music)}).json() == {"pid": os.getpid()}
 
 
 def test_enrich_reports_only_the_sources_it_reached(monkeypatch):

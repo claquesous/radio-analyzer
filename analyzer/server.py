@@ -2,17 +2,24 @@
 
 Run as a single process. The MusicBrainz/AcoustID/Discogs rate limits are enforced
 in-process (http.RateLimiter), so several server processes would exceed them.
-Essentia runs in a process pool inside this one server process."""
-import asyncio
+Essentia runs in a process pool inside this one server process, or in the server
+process itself with ANALYZE_WORKERS=0 (on Lambda).
+
+A song's audio is either a path under MUSIC_ROOT, when the library is mounted
+here, or a URL to download it from (e.g. a presigned S3 GET), when it isn't."""
+import hmac
 import logging
 import multiprocessing
 import os
-from concurrent.futures import ProcessPoolExecutor
-from contextlib import asynccontextmanager
+import tempfile
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from contextlib import asynccontextmanager, contextmanager
 from typing import Optional
+from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+import requests
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException
+from pydantic import BaseModel, model_validator
 
 from . import audio, config, embed, enrich, identify
 
@@ -27,25 +34,45 @@ async def lifespan(app):
         log.warning("ACOUSTID_API_KEY not set; identifying by MusicBrainz text search only")
     if not config.DISCOGS_TOKEN:
         log.warning("DISCOGS_TOKEN not set; skipping Discogs credits and styles")
-    context = multiprocessing.get_context("spawn")
-    with ProcessPoolExecutor(config.ANALYZE_WORKERS, mp_context=context, initializer=audio.init_worker) as pool:
+    if config.ANALYZE_WORKERS > 0:
+        context = multiprocessing.get_context("spawn")
+        executor = ProcessPoolExecutor(config.ANALYZE_WORKERS, mp_context=context, initializer=audio.init_worker)
+    else:
+        executor = ThreadPoolExecutor(1, initializer=audio.init_worker)
+    with executor as pool:
         app.state.pool = pool
         yield
 
 
+def require_token(authorization: Optional[str] = Header(None)):
+    if config.API_TOKEN and not hmac.compare_digest(authorization or "", f"Bearer {config.API_TOKEN}"):
+        raise HTTPException(401, "invalid or missing bearer token")
+
+
 app = FastAPI(title="radio-analyzer", lifespan=lifespan)
+api = APIRouter(dependencies=[Depends(require_token)])
 
 
-class IdentifyRequest(BaseModel):
-    path: str
+class SongAudio(BaseModel):
+    path: Optional[str] = None
+    url: Optional[str] = None
+
+    @model_validator(mode="after")
+    def exactly_one_source(self):
+        if (self.path is None) == (self.url is None):
+            raise ValueError("send exactly one of path or url")
+        return self
+
+
+class IdentifyRequest(SongAudio):
     title: str
     artist: str
     album: Optional[str] = None
     duration: Optional[float] = None
 
 
-class AnalyzeRequest(BaseModel):
-    path: str
+class AnalyzeRequest(SongAudio):
+    pass
 
 
 class EnrichRequest(BaseModel):
@@ -76,40 +103,74 @@ def music_path(path):
     return real
 
 
+@contextmanager
+def song_file(song):
+    """A local file with the song's audio, or None if the song is missing: the file
+    itself for a path, or a temporary download for a URL."""
+    if song.path is not None:
+        path = music_path(song.path)
+        yield path if os.path.exists(path) else None
+        return
+
+    suffix = os.path.splitext(urlparse(song.url).path)[1] or ".mp3"
+    with tempfile.NamedTemporaryFile(suffix=suffix) as f:
+        yield f.name if download(song.url, f) else None
+
+
+def download(url, f):
+    """Write url to f. False if there's nothing there: S3 answers 403 rather than 404
+    for a missing key unless the signer may list the bucket. Any other failure is a
+    502, so the caller retries later instead of recording the song as missing."""
+    try:
+        with requests.get(url, stream=True, timeout=config.DOWNLOAD_TIMEOUT) as resp:
+            if resp.status_code in (403, 404):
+                return False
+            resp.raise_for_status()
+            for chunk in resp.iter_content(chunk_size=1 << 20):
+                f.write(chunk)
+    except requests.RequestException as error:
+        raise HTTPException(502, f"downloading the song failed: {error}")
+    f.flush()
+    return True
+
+
 @app.get("/health")
 def health():
     return {"ok": True}
 
 
-@app.get("/versions")
+@api.get("/versions")
 def versions():
     return {"sound": audio.MODEL_VERSION, "genre": embed.GENRE_MODEL_VERSION}
 
 
-@app.post("/identify")
+@api.post("/identify")
 def identify_song(request: IdentifyRequest):
-    song = {"path": music_path(request.path), "title": request.title, "artist_name": request.artist,
-            "album_title": request.album, "time": request.duration}
-    try:
-        return identify.identify_song(song)
-    except identify.AcoustIDError as error:
-        # A config problem (e.g. a bad API key), not a miss: fail loudly.
-        raise HTTPException(502, f"AcoustID: {error}")
+    with song_file(request) as path:
+        if path is None:
+            return {"status": "missing_file", "mb_recording_id": None, "acoustid": None}
+        song = {"path": path, "title": request.title, "artist_name": request.artist,
+                "album_title": request.album, "time": request.duration}
+        try:
+            return identify.identify_song(song)
+        except identify.AcoustIDError as error:
+            # A config problem (e.g. a bad API key), not a miss: fail loudly.
+            raise HTTPException(502, f"AcoustID: {error}")
 
 
-@app.post("/analyze")
-async def analyze_song(request: AnalyzeRequest):
-    path = music_path(request.path)
-    if not os.path.exists(path):
-        raise HTTPException(404, "missing_file")
-    try:
-        return await asyncio.get_running_loop().run_in_executor(app.state.pool, audio.analyze_in_worker, path)
-    except Exception as error:
-        log.exception("analyze failed for %s", path)
-        raise HTTPException(422, f"analysis failed: {error}")
+@api.post("/analyze")
+def analyze_song(request: AnalyzeRequest):
+    with song_file(request) as path:
+        if path is None:
+            raise HTTPException(404, "missing_file")
+        try:
+            return app.state.pool.submit(audio.analyze_in_worker, path).result()
+        except Exception as error:
+            log.exception("analyze failed for %s", request.path or "song from url")
+            raise HTTPException(422, f"analysis failed: {error}")
 
 
-@app.post("/enrich")
+@api.post("/enrich")
 def enrich_song(request: EnrichRequest):
     return enrich.enrich_song({
         "title": request.title, "artist_name": request.artist, "album_title": request.album,
@@ -118,7 +179,10 @@ def enrich_song(request: EnrichRequest):
     })
 
 
-@app.post("/genre-embedding")
+@api.post("/genre-embedding")
 def genre_embedding(request: GenreEmbeddingRequest):
     vector = embed.genre_embedding([tag.model_dump() for tag in request.tags])
     return {"embedding": None if vector is None else vector.tolist(), "model_version": embed.GENRE_MODEL_VERSION}
+
+
+app.include_router(api)
